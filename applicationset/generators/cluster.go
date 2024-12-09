@@ -90,7 +90,7 @@ func (g *ClusterGenerator) GenerateParams(appSetGenerator *argoappsetv1alpha1.Ap
 	secretsFound := []corev1.Secret{}
 
 	isFlatMode := appSetGenerator.Clusters.FlatList
-	logCtx.Debug("Using flat mode = ", isFlatMode, " for cluster generator")
+	logCtx.Debugf("Using flat mode = %t for cluster generator", isFlatMode)
 	clustersParams := make([]map[string]interface{}, 0)
 
 	for _, cluster := range clustersFromArgoCD.Items {
