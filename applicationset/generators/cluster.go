@@ -56,8 +56,8 @@ func (g *ClusterGenerator) GetTemplate(appSetGenerator *argoappsetv1alpha1.Appli
 	return &appSetGenerator.Clusters.Template
 }
 
-func (g *ClusterGenerator) GenerateParams(appSetGenerator *argoappsetv1alpha1.ApplicationSetGenerator, appSet *argoappsetv1alpha1.ApplicationSet, _ client.Client) ([]map[string]any, error) {
-	logCtx := log.WithField("applicationset", appSet.GetName()).WithField("namespace", appSet.GetNamespace())
+func (g *ClusterGenerator) GenerateParams(appSetGenerator *argoappsetv1alpha1.ApplicationSetGenerator, appSet *argoappsetv1alpha1.ApplicationSet, _ client.Client) ([]map[string]interface{}, error) {
+	logCtx := log.WithField("applicationset", appSet.GetName())
 	if appSetGenerator == nil {
 		return nil, EmptyAppSetGeneratorError
 	}
@@ -90,8 +90,8 @@ func (g *ClusterGenerator) GenerateParams(appSetGenerator *argoappsetv1alpha1.Ap
 	secretsFound := []corev1.Secret{}
 
 	isFlatMode := appSetGenerator.Clusters.FlatList
-	logCtx.Debugf("Using flat mode = %t for cluster generator", isFlatMode)
-	clustersParams := make([]map[string]any, 0)
+	logCtx.Debug("Using flat mode = ", isFlatMode, " for cluster generator")
+	clustersParams := make([]map[string]interface{}, 0)
 
 	for _, cluster := range clustersFromArgoCD.Items {
 		// If there is a secret for this cluster, then it's a non-local cluster, so it will be
