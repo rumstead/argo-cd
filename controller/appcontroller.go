@@ -380,7 +380,11 @@ func (projCache *appProjCache) GetAppProject(ctx context.Context) (*appv1.AppPro
 
 // getAppProj gets the AppProject for the given Application app.
 func (ctrl *ApplicationController) getAppProj(app *appv1.Application) (*appv1.AppProject, error) {
-	projCache, _ := ctrl.projByNameCache.LoadOrStore(app.Spec.GetProject(), ctrl.newAppProjCache(app.Spec.GetProject()))
+	projCache, _ := ctrl.projByNameCache.Load(app.Spec.GetProject())
+	if projCache == nil {
+		projCache = ctrl.newAppProjCache(app.Spec.GetProject())
+		ctrl.projByNameCache.Store(app.Spec.GetProject(), projCache)
+	}
 	proj, err := projCache.(*appProjCache).GetAppProject(context.TODO())
 	if err != nil {
 		if apierr.IsNotFound(err) {
@@ -2093,7 +2097,7 @@ func (ctrl *ApplicationController) autoSync(app *appv1.Application, syncStatus *
 }
 
 // alreadyAttemptedSync returns whether the most recent sync was performed against the
-// commitSHA and with the same app source config which are currently set in the app
+// commitSHA and with the same app source config which are currently set in the app.
 func alreadyAttemptedSync(app *appv1.Application, commitSHA string, commitSHAsMS []string, hasMultipleSources bool, revisionUpdated bool) (bool, synccommon.OperationPhase) {
 	if app.Status.OperationState == nil || app.Status.OperationState.Operation.Sync == nil || app.Status.OperationState.SyncResult == nil {
 		return false, ""
@@ -2118,24 +2122,8 @@ func alreadyAttemptedSync(app *appv1.Application, commitSHA string, commitSHAsMS
 	}
 
 	if hasMultipleSources {
-		// Ignore differences in target revision, since we already just verified commitSHAs are equal,
-		// and we do not want to trigger auto-sync due to things like HEAD != master
-		specSources := app.Spec.Sources.DeepCopy()
-		syncSources := app.Status.OperationState.SyncResult.Sources.DeepCopy()
-		for _, source := range specSources {
-			source.TargetRevision = ""
-		}
-		for _, source := range syncSources {
-			source.TargetRevision = ""
-		}
 		return reflect.DeepEqual(app.Spec.Sources, app.Status.OperationState.SyncResult.Sources), app.Status.OperationState.Phase
 	} else {
-		// Ignore differences in target revision, since we already just verified commitSHAs are equal,
-		// and we do not want to trigger auto-sync due to things like HEAD != master
-		specSource := app.Spec.Source.DeepCopy()
-		specSource.TargetRevision = ""
-		syncResSource := app.Status.OperationState.SyncResult.Source.DeepCopy()
-		syncResSource.TargetRevision = ""
 		return reflect.DeepEqual(app.Spec.GetSource(), app.Status.OperationState.SyncResult.Source), app.Status.OperationState.Phase
 	}
 }
