@@ -39,6 +39,7 @@ import (
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
+	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
@@ -925,10 +926,17 @@ func (server *ArgoCDServer) newGRPCServer() (*grpc.Server, application.AppResour
 		// Remove from logs both because the contents are sensitive and because they may be very large.
 		"/application.ApplicationService/GetManifestsWithFiles": true,
 	}
+	customFunc := func(p interface{}) (err error) {
+		server.log.Errorf("panic triggered: %v %+v", p, debug.Stack())
+		return status.Errorf(codes.Unknown, "panic triggered: %v", p)
+	}
+	opts := []grpc_recovery.Option{
+		grpc_recovery.WithRecoveryHandler(customFunc),
+	}
 	// NOTE: notice we do not configure the gRPC server here with TLS (e.g. grpc.Creds(creds))
 	// This is because TLS handshaking occurs in cmux handling
 	sOpts = append(sOpts, grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
-		grpc_util.PanicLoggerStreamServerInterceptor(server.log),
+		grpc_recovery.StreamServerInterceptor(opts...),
 		otelgrpc.StreamServerInterceptor(), //nolint:staticcheck // TODO: ignore SA1019 for depreciation: see https://github.com/argoproj/argo-cd/issues/18258
 		grpc_logrus.StreamServerInterceptor(server.log),
 		grpc_prometheus.StreamServerInterceptor,
@@ -939,9 +947,10 @@ func (server *ArgoCDServer) newGRPCServer() (*grpc.Server, application.AppResour
 		}),
 		grpc_util.ErrorCodeK8sStreamServerInterceptor(),
 		grpc_util.ErrorCodeGitStreamServerInterceptor(),
+		grpc_util.PanicLoggerStreamServerInterceptor(server.log),
 	)))
 	sOpts = append(sOpts, grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-		grpc_util.PanicLoggerUnaryServerInterceptor(server.log),
+		grpc_recovery.UnaryServerInterceptor(opts...),
 		bug21955WorkaroundInterceptor,
 		otelgrpc.UnaryServerInterceptor(), //nolint:staticcheck // TODO: ignore SA1019 for depreciation: see https://github.com/argoproj/argo-cd/issues/18258
 		grpc_logrus.UnaryServerInterceptor(server.log),
@@ -953,6 +962,7 @@ func (server *ArgoCDServer) newGRPCServer() (*grpc.Server, application.AppResour
 		}),
 		grpc_util.ErrorCodeK8sUnaryServerInterceptor(),
 		grpc_util.ErrorCodeGitUnaryServerInterceptor(),
+		grpc_util.PanicLoggerUnaryServerInterceptor(server.log),
 	)))
 	grpcS := grpc.NewServer(sOpts...)
 
