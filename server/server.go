@@ -926,7 +926,7 @@ func (server *ArgoCDServer) newGRPCServer() (*grpc.Server, application.AppResour
 		// Remove from logs both because the contents are sensitive and because they may be very large.
 		"/application.ApplicationService/GetManifestsWithFiles": true,
 	}
-	customFunc := func(p interface{}) (err error) {
+	customFunc := func(p any) (err error) {
 		server.log.Errorf("panic triggered: %v %+v", p, debug.Stack())
 		return status.Errorf(codes.Unknown, "panic triggered: %v", p)
 	}
