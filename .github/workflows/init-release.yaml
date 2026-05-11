@@ -81,6 +81,7 @@ jobs:
           git diff
 
       - name: Generate version compatibility table
+        if: github.repository == 'argoproj/argo-cd'
         run: |
           git stash
           bash hack/update-supported-versions.sh
