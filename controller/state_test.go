@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/argoproj/argo-cd/v3/common"
+	mockstatecache "github.com/argoproj/argo-cd/v3/controller/cache/mocks"
 	"github.com/argoproj/argo-cd/v3/controller/testdata"
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/v3/reposerver/apiclient"
@@ -2786,6 +2787,109 @@ func Test_EvaluateAppRevisionsChanges(t *testing.T) {
 			assert.Equal(t, tc.expectedHasChanges, hasChanges)
 			require.Len(t, resolvedRevisions, len(tc.sources))
 			assert.Equal(t, tc.expectedResolvedRevisions, resolvedRevisions)
+		})
+	}
+}
+
+// hideSecretDataDiffConfigMap covers the settings hideSecretData resolves: compare options,
+// tracking, sensitive annotations and ignore rules using both jq and JSON pointers.
+var hideSecretDataDiffConfigMap = map[string]string{
+	"application.instanceLabelKey":        "argocd.argoproj.io/instance",
+	"application.resourceTrackingMethod":  "annotation",
+	"resource.compareoptions":             "ignoreAggregatedRoles: true",
+	"resource.sensitive.mask.annotations": "my-sensitive-annotation",
+	"resource.customizations.ignoreDifferences.apps_Deployment": `jqPathExpressions:
+- .spec.template.spec.containers[].image
+jsonPointers:
+- /spec/replicas`,
+	"resource.customizations.ignoreDifferences._Secret": `jsonPointers:
+- /metadata/annotations/ignored`,
+}
+
+func newConfigMapManagedResource(name string, data map[string]string) managedResource {
+	obj := kube.MustToUnstructured(&corev1.ConfigMap{
+		APIVersion: "v1", Kind: "ConfigMap",
+		Name: name, Namespace: "default",
+		Data: data,
+	})
+	return managedResource{
+		Name:      name,
+		Namespace: "default",
+		Kind:      "ConfigMap",
+		Group:     "",
+		Target:    obj,
+		Live:      obj,
+	}
+}
+
+// TestHideSecretData_SharedSetupIsLazyAndResolvedOnce pins the laziness: the cluster cache
+// lookup must not happen at all when no Secret needs a client-side diff, and exactly once no
+// matter how many do.
+func TestHideSecretData_SharedSetupIsLazyAndResolvedOnce(t *testing.T) {
+	t.Parallel()
+
+	secret := func(name string) managedResource {
+		return newSecretManagedResource(name,
+			map[string][]byte{"key": []byte("t-" + name)},
+			map[string][]byte{"key": []byte("l-" + name)},
+		)
+	}
+	ssdSecret := func(name string) managedResource {
+		mr := secret(name)
+		state := `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"` + name + `","namespace":"default"},"data":{"key":"dg=="}}`
+		mr.Diff = diff.DiffResult{Modified: false, PredictedLive: []byte(state), NormalizedLive: []byte(state)}
+		return mr
+	}
+
+	testCases := []struct {
+		name                    string
+		resources               []managedResource
+		serverSideDiff          bool
+		expectedClusterCacheGet int
+	}{
+		{
+			name:                    "no resources",
+			expectedClusterCacheGet: 0,
+		},
+		{
+			name:                    "no secrets",
+			resources:               []managedResource{newConfigMapManagedResource("cm-1", nil), newConfigMapManagedResource("cm-2", nil)},
+			expectedClusterCacheGet: 0,
+		},
+		{
+			name:                    "secrets reusing the server-side diff result",
+			resources:               []managedResource{ssdSecret("a"), ssdSecret("b"), ssdSecret("c")},
+			serverSideDiff:          true,
+			expectedClusterCacheGet: 0,
+		},
+		{
+			name:                    "one secret",
+			resources:               []managedResource{secret("a")},
+			expectedClusterCacheGet: 1,
+		},
+		{
+			name:                    "many secrets",
+			resources:               []managedResource{secret("a"), newConfigMapManagedResource("cm", nil), secret("b"), secret("c"), secret("d")},
+			expectedClusterCacheGet: 1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctrl := newFakeController(t.Context(), &fakeData{configMapData: hideSecretDataDiffConfigMap}, nil)
+			compRes := &comparisonResult{managedResources: tc.resources}
+			if tc.serverSideDiff {
+				compRes.diffConfig = buildSSADiffConfig(t)
+			}
+
+			_, err := ctrl.hideSecretData(t.Context(), &v1alpha1.Cluster{Server: "test", Name: "test"}, newFakeApp(), compRes)
+			require.NoError(t, err)
+
+			stateCache, ok := ctrl.stateCache.(*mockstatecache.LiveStateCache)
+			require.True(t, ok)
+			stateCache.AssertNumberOfCalls(t, "GetClusterCache", tc.expectedClusterCacheGet)
 		})
 	}
 }

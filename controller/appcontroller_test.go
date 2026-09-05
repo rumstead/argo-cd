@@ -4448,3 +4448,114 @@ func TestHandleRefreshAnnotation(t *testing.T) {
 		}, capturedPatches[0], "patch without timestamp should only remove the refresh annotation, no test op")
 	})
 }
+
+// benchmarkHideSecretDataConfigMap is an argocd-cm with ignoreDifferences entries (jq and JSON
+// pointer), compare options and a sensitive annotation. hideSecretData reads all of it, so the
+// benchmark pays a realistic settings cost.
+var benchmarkHideSecretDataConfigMap = map[string]string{
+	"application.instanceLabelKey":        "argocd.argoproj.io/instance",
+	"application.resourceTrackingMethod":  "annotation",
+	"resource.compareoptions":             "ignoreAggregatedRoles: true",
+	"resource.sensitive.mask.annotations": "my-sensitive-annotation,another-sensitive-annotation",
+	"resource.customizations.ignoreDifferences.apps_Deployment": `jqPathExpressions:
+- .spec.template.spec.containers[].image
+- .spec.template.metadata.annotations."kubectl.kubernetes.io/restartedAt"
+jsonPointers:
+- /spec/replicas
+- /metadata/annotations/deployment.kubernetes.io~1revision`,
+	"resource.customizations.ignoreDifferences.apps_StatefulSet": `jqPathExpressions:
+- .spec.volumeClaimTemplates[].metadata.creationTimestamp
+jsonPointers:
+- /spec/replicas`,
+	"resource.customizations.ignoreDifferences._Service": `jsonPointers:
+- /spec/clusterIP
+- /spec/clusterIPs`,
+	"resource.customizations.ignoreDifferences.admissionregistration.k8s.io_MutatingWebhookConfiguration": `jqPathExpressions:
+- .webhooks[].clientConfig.caBundle`,
+	"resource.customizations.ignoreDifferences.all": `managedFieldsManagers:
+- kube-controller-manager`,
+}
+
+// benchmarkHideSecretDataResources builds managedResources with secretCount drifting Secrets
+// plus a few non-Secret resources that pass through untouched.
+func benchmarkHideSecretDataResources(secretCount int) []managedResource {
+	resources := make([]managedResource, 0, secretCount+3)
+	for i := range secretCount {
+		name := "bench-secret-" + strconv.Itoa(i)
+		build := func(suffix string) *unstructured.Unstructured {
+			return kube.MustToUnstructured(&corev1.Secret{
+				APIVersion: "v1", Kind: kube.SecretKind,
+				Name: name, Namespace: test.FakeDestNamespace, Annotations: map[string]string{"my-sensitive-annotation": "secret-" + suffix},
+				Data: map[string][]byte{
+					"username": []byte("user-" + suffix),
+					"password": []byte("pass-" + suffix + "-" + strconv.Itoa(i)),
+					"token":    []byte("token-" + suffix),
+				},
+			})
+		}
+		resources = append(resources, managedResource{
+			Name:      name,
+			Namespace: test.FakeDestNamespace,
+			Kind:      kube.SecretKind,
+			Group:     "",
+			Target:    build("target"),
+			Live:      build("live"),
+		})
+	}
+	nonSecrets := []*unstructured.Unstructured{
+		kube.MustToUnstructured(&corev1.ConfigMap{
+			APIVersion: "v1", Kind: "ConfigMap",
+			Name: "bench-cm", Namespace: test.FakeDestNamespace,
+			Data: map[string]string{"key": "value"},
+		}),
+		kube.MustToUnstructured(&corev1.Service{
+			APIVersion: "v1", Kind: "Service",
+			Name: "bench-svc", Namespace: test.FakeDestNamespace,
+			Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
+		}),
+		kube.MustToUnstructured(&appsv1.Deployment{
+			APIVersion: "apps/v1", Kind: "Deployment",
+			Name: "bench-deploy", Namespace: test.FakeDestNamespace,
+		}),
+	}
+	for _, obj := range nonSecrets {
+		gvk := obj.GroupVersionKind()
+		resources = append(resources, managedResource{
+			Name:      obj.GetName(),
+			Namespace: obj.GetNamespace(),
+			Kind:      gvk.Kind,
+			Group:     gvk.Group,
+			Target:    obj,
+			Live:      obj,
+		})
+	}
+	return resources
+}
+
+func BenchmarkHideSecretData(b *testing.B) {
+	for _, secretCount := range []int{1, 10, 50} {
+		b.Run("secrets="+strconv.Itoa(secretCount), func(b *testing.B) {
+			ctrl := newFakeController(b.Context(), &fakeData{configMapData: benchmarkHideSecretDataConfigMap}, nil)
+			app := newFakeApp()
+			app.Spec.IgnoreDifferences = []v1alpha1.ResourceIgnoreDifferences{{
+				Group:             "apps",
+				Kind:              "Deployment",
+				JSONPointers:      []string{"/spec/replicas"},
+				JQPathExpressions: []string{".spec.template.spec.containers[].resources"},
+			}}
+			compRes := &comparisonResult{managedResources: benchmarkHideSecretDataResources(secretCount)}
+			destCluster := &v1alpha1.Cluster{Server: "test", Name: "test"}
+
+			b.ReportAllocs()
+			for b.Loop() {
+				items, err := ctrl.hideSecretData(b.Context(), destCluster, app, compRes)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(items) != len(compRes.managedResources) {
+					b.Fatalf("expected %d items, got %d", len(compRes.managedResources), len(items))
+				}
+			}
+		})
+	}
+}

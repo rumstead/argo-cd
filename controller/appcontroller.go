@@ -792,8 +792,52 @@ func (ctrl *ApplicationController) getAppHosts(destCluster *appv1.Cluster, a *ap
 	return hosts, nil
 }
 
+// newSecretDiffConfig builds the no-cache DiffConfig used to recompute a masked Secret's
+// client-side diff. It doesn't depend on the Secret, so hideSecretData builds it at most once.
+func (ctrl *ApplicationController) newSecretDiffConfig(destCluster *appv1.Cluster, app *appv1.Application) (argodiff.DiffConfig, error) {
+	compareOptions, err := ctrl.settingsMgr.GetResourceCompareOptions()
+	if err != nil {
+		return nil, fmt.Errorf("error getting resource compare options: %w", err)
+	}
+	resourceOverrides, err := ctrl.settingsMgr.GetResourceOverrides()
+	if err != nil {
+		return nil, fmt.Errorf("error getting resource overrides: %w", err)
+	}
+	appLabelKey, err := ctrl.settingsMgr.GetAppInstanceLabelKey()
+	if err != nil {
+		return nil, fmt.Errorf("error getting app instance label key: %w", err)
+	}
+	trackingMethod, err := ctrl.settingsMgr.GetTrackingMethod()
+	if err != nil {
+		return nil, fmt.Errorf("error getting tracking method: %w", err)
+	}
+
+	clusterCache, err := ctrl.stateCache.GetClusterCache(destCluster)
+	if err != nil {
+		return nil, fmt.Errorf("error getting cluster cache: %w", err)
+	}
+	diffConfig, err := argodiff.NewDiffConfigBuilder().
+		WithDiffSettings(app.Spec.IgnoreDifferences, resourceOverrides, compareOptions.IgnoreAggregatedRoles, ctrl.ignoreNormalizerOpts).
+		WithTracking(appLabelKey, trackingMethod).
+		WithNoCache().
+		WithLogger(logutils.NewLogrusLogger(logutils.NewWithCurrentConfig())).
+		WithGVKParser(clusterCache.GetGVKParser()).
+		Build()
+	if err != nil {
+		return nil, fmt.Errorf("appcontroller error building diff config: %w", err)
+	}
+	return diffConfig, nil
+}
+
 func (ctrl *ApplicationController) hideSecretData(ctx context.Context, destCluster *appv1.Cluster, app *appv1.Application, comparisonResult *comparisonResult) ([]*appv1.ResourceDiff, error) {
 	items := make([]*appv1.ResourceDiff, len(comparisonResult.managedResources))
+	// These are the same for every Secret, but resolving them re-parses argocd-cm and recompiles
+	// every ignore-difference expression. Resolve lazily so an Application with no Secrets pays
+	// nothing.
+	var hideAnnots map[string]bool
+	hideAnnotsResolved := false
+	// secretDiffConfig is nil until the first Secret that needs a client-side diff.
+	var secretDiffConfig argodiff.DiffConfig
 	for i := range comparisonResult.managedResources {
 		res := comparisonResult.managedResources[i]
 		item := appv1.ResourceDiff{
@@ -810,7 +854,10 @@ func (ctrl *ApplicationController) hideSecretData(ctx context.Context, destClust
 		resDiff := res.Diff
 		if res.Kind == kube.SecretKind && res.Group == "" {
 			var err error
-			hideAnnots := ctrl.settingsMgr.GetSensitiveAnnotations()
+			if !hideAnnotsResolved {
+				hideAnnots = ctrl.settingsMgr.GetSensitiveAnnotations()
+				hideAnnotsResolved = true
+			}
 			target, live, err = diff.HideSecretData(res.Target, res.Live, hideAnnots)
 			if err != nil {
 				return nil, fmt.Errorf("error hiding secret data: %w", err)
@@ -854,39 +901,14 @@ func (ctrl *ApplicationController) hideSecretData(ctx context.Context, destClust
 				}
 			}
 			if !useSSDResult {
-				compareOptions, err := ctrl.settingsMgr.GetResourceCompareOptions()
-				if err != nil {
-					return nil, fmt.Errorf("error getting resource compare options: %w", err)
-				}
-				resourceOverrides, err := ctrl.settingsMgr.GetResourceOverrides()
-				if err != nil {
-					return nil, fmt.Errorf("error getting resource overrides: %w", err)
-				}
-				appLabelKey, err := ctrl.settingsMgr.GetAppInstanceLabelKey()
-				if err != nil {
-					return nil, fmt.Errorf("error getting app instance label key: %w", err)
-				}
-				trackingMethod, err := ctrl.settingsMgr.GetTrackingMethod()
-				if err != nil {
-					return nil, fmt.Errorf("error getting tracking method: %w", err)
+				if secretDiffConfig == nil {
+					secretDiffConfig, err = ctrl.newSecretDiffConfig(destCluster, app)
+					if err != nil {
+						return nil, err
+					}
 				}
 
-				clusterCache, err := ctrl.stateCache.GetClusterCache(destCluster)
-				if err != nil {
-					return nil, fmt.Errorf("error getting cluster cache: %w", err)
-				}
-				diffConfig, err := argodiff.NewDiffConfigBuilder().
-					WithDiffSettings(app.Spec.IgnoreDifferences, resourceOverrides, compareOptions.IgnoreAggregatedRoles, ctrl.ignoreNormalizerOpts).
-					WithTracking(appLabelKey, trackingMethod).
-					WithNoCache().
-					WithLogger(logutils.NewLogrusLogger(logutils.NewWithCurrentConfig())).
-					WithGVKParser(clusterCache.GetGVKParser()).
-					Build()
-				if err != nil {
-					return nil, fmt.Errorf("appcontroller error building diff config: %w", err)
-				}
-
-				diffResult, err := argodiff.StateDiff(ctx, live, target, diffConfig)
+				diffResult, err := argodiff.StateDiff(ctx, live, target, secretDiffConfig)
 				if err != nil {
 					return nil, fmt.Errorf("error applying diff: %w", err)
 				}
